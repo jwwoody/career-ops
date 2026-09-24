@@ -233,6 +233,7 @@ const SYSTEM_PATHS = [
   'lib/gemini-node-floor.mjs',
   'lib/local-today.mjs',
   'lib/placeholder-cell.mjs',
+  'lib/tracker-addition.mjs',
   'lib/scan-summary-marker.mjs',
   'lib/is-main-module.mjs',
   'lib/mjs-files.mjs',
@@ -240,6 +241,7 @@ const SYSTEM_PATHS = [
   'lib/outcome-types.mjs',
   'lib/latex-escape.mjs',
   'lib/cv-payload-schema.mjs',
+  'lib/page-format.mjs',
   'scan-hn.mjs',
   'scripts/check-syntax.mjs',
   'scripts/export-ats-text.mjs',
@@ -296,6 +298,7 @@ const SYSTEM_PATHS = [
   'application-artifacts.mjs',
   'batch-evaluate-gemini.mjs',
   'providers/',
+  'data-static/',
   'seeds/',
   'tests/',
   'user-agent.mjs',
@@ -393,7 +396,29 @@ const SYSTEM_PATHS = [
   'DATA_CONTRACT.md',
   'MANIFESTO.md',
   'manifesto.mjs',
-  'SIGNATURES.md',
+  // SIGNATURES.md cannot join SYSTEM_PATHS: unlike every other system file it
+  // is a pure append-only ledger of who signed the manifesto, and it churns
+  // far faster than the code it would ship beside (49 commits in the 30 days
+  // before this was written). Nothing on an install reads it — manifesto.mjs
+  // parses MANIFESTO.md and never opens it — so shipping it buys an install
+  // nothing, while listing it here puts it in the pathspec check() diffs via
+  // systemTreeDiffers, which turns every new signature into a
+  // system-files-changed report on every install in the world that no apply
+  // can clear for long (#4062). That is one cause of the #3149 class of
+  // permanent update-available, beside the SHA-vs-content bug of #2630, the
+  // ignore-rule route of #2756, and the symlinked skill entrypoints that a
+  // core.symlinks=false checkout materialises into regular files. Do not fix
+  // that last one the way this entry was fixed: the entrypoints must stay in
+  // SYSTEM_PATHS and be excluded from the drift comparison instead, because
+  // ensureSkillEntrypoints only refreshes an entry that still holds the
+  // pointer, so an entrypoint dropped from the manifest silently freezes.
+  // The SIGNATURES.md repo-only coverage is declared in
+  // validate-system-paths-coverage.mjs, and the behaviour is pinned by
+  // tests/updater-signature-ledger-drift.test.mjs.
+  //
+  // Keep this comment free of straight quotes: updater-migration-tests.mjs
+  // parses this array with a comment-blind regex, so an apostrophe here
+  // becomes a phantom manifest entry.
   'CONTRIBUTING.md',
   'MAINTAINERS.md',
   'ARCHITECTURE.md',
@@ -970,6 +995,35 @@ function pathMatchesManifest(file, entry) {
   return normalizedFile === normalizedEntry || normalizedFile.startsWith(`${normalizedEntry}/`);
 }
 
+// Per-application generated CVs/cover letters that some installs save
+// directly under `templates/` (the documented `templates/cv-{candidate}-
+// {company-slug}.html` / `templates/cover-{candidate}-{company-slug}.html`
+// convention — see modes/pdf.md / modes/_custom.md, #3636). These are user
+// data, not system template files, but they sit inside the SAME directory as
+// the real shipped templates (`cv-template.html`, `cv-template.zh-minimal.html`,
+// `cover-letter-template.html`, ...), so the `templates/` directory-prefix
+// entry in SYSTEM_PATHS can't tell them apart, and USER_PATHS' plain
+// prefix/exact matching (pathMatchesManifest) can't either — both sides share
+// the `templates/` prefix, so a prefix-based carve-out for one would swallow
+// the other. This checks the basename shape instead of the directory.
+//
+// Every real system template file under templates/ is named `cv-template*`
+// or `cover-letter-template*`; nothing generated from a real candidate/company
+// slug collides with that, because the slug is never literally "template" /
+// "letter-template". The one theoretical miss — a company slug that itself
+// starts with "template" (e.g. "Template Corp") — leaves that one generated
+// file classified as a system file, i.e. still exposed to the pre-#3636
+// behavior. That is a no-op for safety (unchanged, not worsened) rather than
+// a new failure mode, so it is an acceptable trade-off for a heuristic that
+// needs no maintenance when new system template variants ship.
+const GENERATED_CV_ARTIFACT_RE = /^templates\/cv-(?!template(?:[.-]|$))[^/]+\.html$/;
+const GENERATED_COVER_ARTIFACT_RE = /^templates\/cover-(?!letter-template(?:[.-]|$))[^/]+\.html$/;
+
+export function isGeneratedTemplateArtifact(file) {
+  const normalized = normalizeRepoPath(file);
+  return GENERATED_CV_ARTIFACT_RE.test(normalized) || GENERATED_COVER_ARTIFACT_RE.test(normalized);
+}
+
 export function staleSystemFiles(localFiles, remoteFiles, systemPaths, userPaths = USER_PATHS) {
   const remote = new Set([...remoteFiles].map(normalizeRepoPath));
   if (remote.size === 0) return [];
@@ -977,7 +1031,8 @@ export function staleSystemFiles(localFiles, remoteFiles, systemPaths, userPaths
     .map(normalizeRepoPath)
     .filter((file) => !remote.has(file))
     .filter((file) => systemPaths.some((entry) => pathMatchesManifest(file, entry)))
-    .filter((file) => !userPaths.some((entry) => pathMatchesManifest(file, entry)));
+    .filter((file) => !userPaths.some((entry) => pathMatchesManifest(file, entry)))
+    .filter((file) => !isGeneratedTemplateArtifact(file));
 }
 
 // A stale-file prune candidate can still be load-bearing for a file this same
@@ -1000,6 +1055,46 @@ export function isReferencedByPreservedFile(candidatePath, preservedPaths, readF
       return false;
     }
   });
+}
+
+// A stale-file prune candidate may never have been an upstream file at all.
+// `staleSystemFiles()` selects on "absent from upstream's CURRENT tree", which
+// cannot tell a file upstream retired from a file upstream never carried — a
+// provider, test or registry entry a fork added under one of the ~50
+// directory-prefix SYSTEM_PATHS entries (`providers/`, `tests/`, `templates/`,
+// `docs/`, `modes/*/`, ...). Both are "local, not in the new tree", and the
+// prune deleted both (#3971; same root cause as #3636 and #3696 on a third
+// surface, where no USER_PATHS carve-out applies because the file genuinely IS
+// system-layer, and no filename shape distinguishes it — a fork's
+// `providers/acme.mjs` is spelled exactly like a shipped provider).
+//
+// Upstream's HISTORY settles it, and `apply()` already fetched it: a path that
+// appears in no commit reachable from the fetched ref was never shipped, so its
+// absence from the current tree is not evidence of anything. A path that DOES
+// appear there, but is gone now, is a real removal and still prunes — including
+// the case of a file upstream MOVED (its old path is in history), which is why
+// this does not simply disable the feature.
+//
+// Fails safe: pruning requires positive proof the file was shipped. On a
+// shallow clone the walk returns empty, and on a broken ref it throws; both
+// answer "not proven", so the file is kept.
+// Keeping a retired file is a cosmetic regression (#2532); deleting a fork's
+// source file is not recoverable from the update itself.
+export function wasEverShippedUpstream(candidatePath, ref = 'FETCH_HEAD', revList = (...args) => gitQuiet(...args)) {
+  const file = normalizeRepoPath(candidatePath);
+  if (!file) return false;
+  try {
+    // --literal-pathspecs: `-- <path>` is a PATHSPEC, so a tracked filename
+    // containing glob metacharacters would be matched as a pattern. A local
+    // `modes/_share[a-z].md` matches upstream's `modes/_shared.md`, reads as
+    // "shipped", and is pruned — the exact deletion this function prevents.
+    return revList('--literal-pathspecs', 'rev-list', '--max-count=1', ref, '--', file) !== '';
+  } catch {
+    // No evidence either way. The caller prunes only on a TRUE return, so
+    // false is the safe answer: pruning requires positive proof the file was
+    // shipped, never the mere absence of a usable answer.
+    return false;
+  }
 }
 
 // Files the self-reexec stage must check out so the TARGET update-system.mjs
@@ -1247,9 +1342,16 @@ export function locallyModifiedSystemFiles(paths, upstreamRef = 'FETCH_HEAD', ct
   // re-running reproduces the same state, so the install stayed stuck. Filtering
   // here also gives the `.bak` failure branch back its single meaning: a backup
   // that genuinely could not be written (permissions, full disk).
+  //
+  // A generated per-application CV/cover-letter under templates/ (#3636) has
+  // no upstream counterpart by construction, so it always "differs from
+  // upstream" here — without this filter every one of a user's generated CVs
+  // would be reported as a locally-modified system file about to be
+  // overwritten and get a needless `.bak` copy written next to it.
   const root = ctx.root || ROOT;
   return [...new Set(atRisk)]
     .filter((file) => existsSync(join(root, ...file.split('/'))))
+    .filter((file) => !isGeneratedTemplateArtifact(file))
     .sort();
 }
 
@@ -2312,6 +2414,10 @@ async function apply() {
         for (const f of staleCandidates) {
           if (isReferencedByPreservedFile(f, preservedPaths)) {
             console.log(`Kept stale asset still referenced by a preserved file: ${f}`);
+            continue;
+          }
+          if (!wasEverShippedUpstream(f, 'FETCH_HEAD')) {
+            console.log(`Kept local file upstream has never shipped: ${f}`);
             continue;
           }
           try {
