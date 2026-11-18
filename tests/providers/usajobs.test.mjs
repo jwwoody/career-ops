@@ -9,7 +9,7 @@ console.log('\nProvider — usajobs');
 
 const mod = await import(pathToFileURL(join(ROOT, 'providers/usajobs.mjs')).href);
 const provider = mod.default;
-const { mapItem } = mod;
+const { mapItem, mapSalary, hiringPathAllowed } = mod;
 
 const item = {
   MatchedObjectId: '123456',
@@ -88,6 +88,55 @@ if (seenHeaders.every((h) => h['Authorization-Key'] === 'test-key' && h['User-Ag
   pass('usajobs sends the key in Authorization-Key and the contact email in User-Agent');
 } else {
   fail(`usajobs headers were ${JSON.stringify(seenHeaders[0])}`);
+}
+
+// Salary: annual (PA) rows map to the scanner's salary shape; other intervals are left out.
+const annual = mapSalary({ PositionRemuneration: [{ MinimumRange: '104349', MaximumRange: '161313', RateIntervalCode: 'PA' }] });
+if (annual?.min === 104349 && annual.max === 161313 && annual.currency === 'USD') pass('mapSalary maps a per-year range to {min, max, currency: USD}');
+else fail(`mapSalary produced ${JSON.stringify(annual)}`);
+if (mapSalary({ PositionRemuneration: [{ MinimumRange: '25.10', MaximumRange: '32.63', RateIntervalCode: 'PH' }] }) === undefined) {
+  pass('mapSalary leaves an hourly range out rather than converting it');
+} else {
+  fail('mapSalary converted an hourly range');
+}
+if (mapSalary({ PositionRemuneration: [{ MinimumRange: '0', MaximumRange: '', RateIntervalCode: 'PA' }] }) === undefined && mapSalary({}) === undefined) {
+  pass('mapSalary returns nothing when the source gives no real figures');
+} else {
+  fail('mapSalary invented a salary from empty figures');
+}
+const withPay = mapItem({ MatchedObjectDescriptor: { ...item.MatchedObjectDescriptor, PositionRemuneration: [{ MinimumRange: '90000', MaximumRange: '120000', RateIntervalCode: 'PA' }] } });
+if (withPay?.salary?.min === 90000 && withPay.salary.max === 120000) pass('mapItem attaches the annual salary');
+else fail(`mapItem salary was ${JSON.stringify(withPay?.salary)}`);
+if (mapItem(item)?.salary === undefined) pass('mapItem omits salary when the posting has none');
+else fail('mapItem attached a salary to a posting without one');
+
+// Hiring path: default keeps postings open to the public only.
+const hp = (paths) => ({ MatchedObjectDescriptor: { ...item.MatchedObjectDescriptor, UserArea: { Details: { HiringPath: paths } } } });
+if (hiringPathAllowed(hp(['fed-transition', 'public']), ['public']) && !hiringPathAllowed(hp(['fed-internal-search']), ['public'])) {
+  pass('hiringPathAllowed keeps public postings and drops federal-internal ones');
+} else {
+  fail('hiringPathAllowed did not split public from internal postings');
+}
+if (hiringPathAllowed(hp(['vet']), ['public', 'vet']) && hiringPathAllowed(hp(['nguard']), [])) {
+  pass('hiringPathAllowed honours a custom list, and an empty list keeps everything');
+} else {
+  fail('hiringPathAllowed ignored a custom or empty list');
+}
+if (hiringPathAllowed(item, ['public'])) pass('hiringPathAllowed keeps a posting that states no hiring path');
+else fail('hiringPathAllowed dropped a posting with no hiring path');
+
+const mixedCtx = {
+  fetchJson: async () => ({ SearchResult: { SearchResultCountAll: 2, SearchResultItems: [
+    { MatchedObjectDescriptor: { ...hp(['public']).MatchedObjectDescriptor, PositionURI: 'https://www.usajobs.gov/job/1' } },
+    { MatchedObjectDescriptor: { ...hp(['fed-internal-search']).MatchedObjectDescriptor, PositionURI: 'https://www.usajobs.gov/job/2' } },
+  ] } }),
+};
+const byDefault = await provider.fetch({ name: 'USAJobs', search_terms: ['x'] }, mixedCtx);
+const allPaths = await provider.fetch({ name: 'USAJobs', search_terms: ['x'], hiring_paths: [] }, mixedCtx);
+if (byDefault.length === 1 && byDefault[0].url.endsWith('/job/1') && allPaths.length === 2) {
+  pass('usajobs fetch drops non-public postings by default; hiring_paths: [] keeps them');
+} else {
+  fail(`usajobs fetch returned ${byDefault.length} by default and ${allPaths.length} with hiring_paths: []`);
 }
 
 if (savedKey === undefined) delete process.env.USAJOBS_API_KEY; else process.env.USAJOBS_API_KEY = savedKey;

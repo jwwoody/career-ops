@@ -27,14 +27,59 @@ const DEFAULT_TERMS = [
   'data analyst intern',
 ];
 
+// Who may apply. Most postings are open only to current federal employees,
+// veterans, National Guard members and similar groups; a candidate outside
+// them cannot apply. Overridable per entry via `hiring_paths: [...]`; an empty
+// list keeps every posting.
+const DEFAULT_HIRING_PATHS = ['public'];
+
 /** @param {unknown} v */
 const str = (v) => (typeof v === 'string' ? v.trim() : '');
+
+/**
+ * Annual pay range from PositionRemuneration. Only per-year (`PA`) rows are
+ * used: hourly and other intervals are left out rather than converted.
+ * @param {any} d MatchedObjectDescriptor
+ * @returns {{min?: number, max?: number, currency: string} | undefined}
+ */
+export function mapSalary(d) {
+  const rows = Array.isArray(d?.PositionRemuneration) ? d.PositionRemuneration : [];
+  const row = rows.find((r) => str(r?.RateIntervalCode).toUpperCase() === 'PA');
+  if (!row) return undefined;
+  const num = (v) => {
+    const n = Number(str(v));
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+  };
+  const min = num(row.MinimumRange);
+  const max = num(row.MaximumRange);
+  if (min === undefined && max === undefined) return undefined;
+  /** @type {{min?: number, max?: number, currency: string}} */
+  const salary = { currency: 'USD' };
+  if (min !== undefined) salary.min = min;
+  if (max !== undefined) salary.max = max;
+  return salary;
+}
+
+/**
+ * True when the posting is open to at least one of `paths`. A posting that
+ * states no hiring path is kept: missing data is not evidence it is closed to
+ * the candidate. An empty `paths` keeps everything.
+ * @param {any} item SearchResultItem
+ * @param {string[]} paths
+ */
+export function hiringPathAllowed(item, paths) {
+  if (!paths.length) return true;
+  const hp = item?.MatchedObjectDescriptor?.UserArea?.Details?.HiringPath;
+  const list = (Array.isArray(hp) ? hp : [hp]).map((v) => str(v).toLowerCase()).filter(Boolean);
+  if (!list.length) return true;
+  return list.some((v) => paths.includes(v));
+}
 
 /**
  * Maps one SearchResultItem to the scanner's Job shape. Returns null when the
  * item lacks the fields the scanner needs (title and a public URL).
  * @param {any} item
- * @returns {{title: string, url: string, company: string, location: string, postedAt?: number, requisitionId?: string, description?: string} | null}
+ * @returns {{title: string, url: string, company: string, location: string, postedAt?: number, requisitionId?: string, description?: string, salary?: {min?: number, max?: number, currency: string}} | null}
  */
 export function mapItem(item) {
   const d = item?.MatchedObjectDescriptor;
@@ -56,6 +101,8 @@ export function mapItem(item) {
   if (reqId) job.requisitionId = reqId;
   const desc = str(d.QualificationSummary) || str(d.UserArea?.Details?.JobSummary);
   if (desc) job.description = desc;
+  const salary = mapSalary(d);
+  if (salary) job.salary = salary;
   return job;
 }
 
@@ -67,7 +114,7 @@ export default {
   // so this provider never claims a careers URL the user did not point at it.
 
   /**
-   * @param {{ name?: string, search_terms?: string[] }} entry
+   * @param {{ name?: string, search_terms?: string[], hiring_paths?: string[] }} entry
    * @param {{ fetchJson: (url: string, opts?: any) => Promise<any>, sleep?: (ms: number) => Promise<void> }} ctx
    * @returns {Promise<any[]>}
    */
@@ -82,6 +129,9 @@ export default {
     const terms = Array.isArray(entry.search_terms) && entry.search_terms.length
       ? entry.search_terms.map(str).filter(Boolean)
       : DEFAULT_TERMS;
+    const paths = Array.isArray(entry.hiring_paths)
+      ? entry.hiring_paths.map((v) => str(v).toLowerCase()).filter(Boolean)
+      : DEFAULT_HIRING_PATHS;
 
     /** @type {Map<string, any>} */
     const seen = new Map();
@@ -103,6 +153,7 @@ export default {
           throw new Error(`usajobs: unexpected API response — missing SearchResult.SearchResultItems`);
         }
         for (const it of items) {
+          if (!hiringPathAllowed(it, paths)) continue;
           const job = mapItem(it);
           if (job && !seen.has(job.url)) seen.set(job.url, job);
         }
