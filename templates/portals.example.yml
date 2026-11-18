@@ -1709,6 +1709,13 @@ search_queries:
 #   max_pages: 5          # optional page cap per keyword (100 jobs/page, default 5, max 100)
 #   enabled: true
 #
+# - name: USAJobs — Software (US federal)  # US federal jobs API (free key)
+#   provider: usajobs
+#   # Needs USAJOBS_API_KEY and USAJOBS_CONTACT_EMAIL in the data-root .env.
+#   search_terms: ["software engineer", "IT specialist"]  # optional (default: early-career terms)
+#   hiring_paths: [public]   # optional (default: [public]); e.g. [public, vet], or [] for all
+#   enabled: true
+#
 # - name: Arbeitsagentur — AI Roles      # German federal jobs API
 #   provider: arbeitsagentur
 #   arbeitsagentur:
